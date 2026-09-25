@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 
@@ -685,3 +686,168 @@ class TestReadOnlySnapshot:
         assert body["readings_count"] == 4
         assert len(body["spikes"]) == 1
         assert body["spikes"][0]["value"] == 999
+
+
+class TestOverflowSafeMedian:
+    """Even-count medians must never poison finite stats with Infinity.
+
+    ``statistics.median`` averages the two middle values as ``(a + b) / 2``,
+    whose intermediate sum overflows for very large readings; the endpoint
+    must instead return the finite midpoint and keep strict MAD detection.
+    """
+
+    def test_four_1e308_neighbours_candidate_zero_is_flagged(self, client):
+        # The reported regression: candidate 0, four neighbours of 1e308, all
+        # inside one window.  The naive (1e308 + 1e308) / 2 overflows to
+        # Infinity, which made median/MAD/deviation Infinity and the strict
+        # comparison false -- the spike was missed.
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        layout = [
+            (1, "2026-01-01T10:00:00Z", 1e308),
+            (2, "2026-01-01T10:00:05Z", 1e308),
+            (3, "2026-01-01T10:00:10Z", 0.0),
+            (4, "2026-01-01T10:00:15Z", 1e308),
+            (5, "2026-01-01T10:00:20Z", 1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+
+        # Strict JSON: NaN/Infinity are invalid tokens, so a poisoned result
+        # fails at decoding rather than silently round-tripping.
+        r = call(c, sid, window="60", sensitivity="3")
+        assert r.status_code == 200, r.text
+        body = json.loads(r.content.decode("utf-8"), parse_constant=_reject_nonfinite)
+        assert body["valid_count"] == 5
+        assert body["insufficient_neighbors_count"] == 0
+        assert spike_keys(body) == [("2026-01-01T10:00:10Z", 3)]
+        sp = body["spikes"][0]
+        assert sp["value"] == 0
+        assert sp["local_median"] == 1e308
+        assert sp["mad"] == 0
+        assert sp["deviation"] == 1e308
+        assert all(math.isfinite(x) for x in (
+            sp["local_median"], sp["mad"], sp["deviation"]
+        ))
+
+    def test_four_negative_1e308_neighbours_candidate_zero_is_flagged(self, client):
+        # Same overflow on the negative half-axis: (-1e308 + -1e308) / 2.
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        layout = [
+            (1, "2026-01-01T10:00:00Z", -1e308),
+            (2, "2026-01-01T10:00:05Z", -1e308),
+            (3, "2026-01-01T10:00:10Z", 0.0),
+            (4, "2026-01-01T10:00:15Z", -1e308),
+            (5, "2026-01-01T10:00:20Z", -1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+
+        r = call(c, sid, window="60", sensitivity="3")
+        assert r.status_code == 200, r.text
+        body = json.loads(r.content.decode("utf-8"), parse_constant=_reject_nonfinite)
+        assert spike_keys(body) == [("2026-01-01T10:00:10Z", 3)]
+        sp = body["spikes"][0]
+        assert sp["local_median"] == -1e308
+        assert sp["mad"] == 0
+        assert sp["deviation"] == 1e308
+
+    def test_mad_even_average_near_max_does_not_overflow(self, client):
+        # Candidate 1e308 with two 1e308 and two -1e308 neighbours: the
+        # neighbour median is 0 and every deviation is 1e308, so the MAD's
+        # even-count average is (1e308 + 1e308) / 2 -- another intermediate
+        # overflow.  With a finite MAD of 1e308 and deviation also 1e308, the
+        # strict ``deviation > sensitivity * MAD`` must stay false at k = 1;
+        # under the bug the MAD became Infinity.
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        # Two extremes (one of each sign) exactly 60s on either side of the
+        # centre candidate.  The inclusive 60s window gives the candidate four
+        # neighbours, while each extreme sees only its same-moment companion
+        # and the centre (two neighbours) and stays undecided.
+        layout = [
+            (1, "2026-01-01T09:59:00Z", 1e308),
+            (2, "2026-01-01T09:59:00Z", -1e308),
+            (3, "2026-01-01T10:00:00Z", 1e308),
+            (4, "2026-01-01T10:01:00Z", 1e308),
+            (5, "2026-01-01T10:01:00Z", -1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+
+        def analyse(sensitivity):
+            r = call(
+                c, sid,
+                lo="2026-01-01T09:59:00Z",
+                hi="2026-01-01T10:01:00Z",
+                window="60", sensitivity=sensitivity,
+            )
+            assert r.status_code == 200, r.text
+            return json.loads(r.content.decode("utf-8"), parse_constant=_reject_nonfinite)
+
+        body = analyse("1")
+        assert body["insufficient_neighbors_count"] == 4
+        assert body["spikes"] == []
+
+        # With sensitivity below 1 the same finite MAD lets the candidate flag,
+        # exposing median 0 / MAD 1e308 / deviation 1e308 as finite numbers.
+        body = analyse("0.5")
+        assert spike_keys(body) == [("2026-01-01T10:00:00Z", 3)]
+        cand = body["spikes"][0]
+        assert cand["value"] == 1e308
+        assert cand["local_median"] == 0
+        assert cand["mad"] == 1e308
+        assert cand["deviation"] == 1e308
+        assert all(math.isfinite(x) for x in (
+            cand["local_median"], cand["mad"], cand["deviation"]
+        ))
+
+
+class TestFiniteMedianHelper:
+    """Direct checks of the overflow-safe median building blocks."""
+
+    def test_midpoint_of_two_max_values(self):
+        from app.local_spikes import _midpoint
+
+        assert _midpoint(1e308, 1e308) == 1e308
+        assert _midpoint(-1e308, -1e308) == -1e308
+        assert math.isfinite(_midpoint(1e308, 1e308))
+        assert math.isfinite(_midpoint(-1e308, -1e308))
+
+    def test_midpoint_opposite_signs(self):
+        from app.local_spikes import _midpoint
+
+        assert _midpoint(-1e308, 1e308) == 0.0
+        # Ordinary mixed-sign midpoint is the exact arithmetic mean.
+        assert _midpoint(-2.0, 4.0) == 1.0
+        # A tiny positive value next to -1e308 still yields a finite midpoint
+        # (the +0.5 contribution is lost at this scale, but never Infinity).
+        result = _midpoint(-1e308, 1.0)
+        assert math.isfinite(result)
+        assert result == pytest.approx(-5e307, rel=1e-15)
+
+    def test_median_odd_and_even_counts(self):
+        from app.local_spikes import _finite_median
+
+        assert _finite_median([1e308, 1e308, 1e308]) == 1e308
+        assert _finite_median([1e308] * 4) == 1e308
+        assert _finite_median([-1e308] * 4) == -1e308
+        # Mixed extreme neighbours: the even-count mean is 0 (no overflow).
+        assert _finite_median([-1e308, -1e308, 1e308, 1e308]) == 0.0
+        # Ordinary values keep the usual arithmetic mean.
+        assert _finite_median([8.0, 10.0, 10.0, 12.0]) == 10.0
+        assert _finite_median([10.0, 10.0, 12.0, 12.0]) == 11.0
+
+    def test_mad_median_of_extreme_deviations_is_finite(self):
+        from app.local_spikes import _finite_median
+
+        deviations = [1e308, 1e308, 1e308, 1e308]
+        mad = _finite_median(deviations)
+        assert mad == 1e308
+        assert math.isfinite(mad)
+
+
+def _reject_nonfinite(token: str):
+    """``parse_constant`` hook: strict JSON must never carry NaN/Infinity."""
+    raise ValueError(f"non-finite JSON token: {token}")

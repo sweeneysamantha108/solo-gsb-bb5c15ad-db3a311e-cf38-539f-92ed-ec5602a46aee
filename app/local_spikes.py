@@ -27,6 +27,13 @@ The comparison is strict, so when every neighbour is identical (``MAD = 0``)
 only a reading whose value differs from the median (strict deviation above
 zero) is flagged.
 
+Even-count medians average the two middle values *without* an intermediate
+overflow: the midpoint of two finite doubles is itself finite, so four
+neighbours of ``1e308`` (whose naive ``(1e308 + 1e308) / 2`` overflows to
+Infinity) still yield the finite median ``1e308`` and, when the neighbours
+agree, ``MAD = 0``.  Every statistic whose mathematical value is a finite
+double is therefore returned as a finite JSON number -- never NaN/Infinity.
+
 To keep the O(n^2) neighbour scan bounded, an interval containing more than
 200 published readings is rejected with 400 instead of being analysed.  The
 whole read -- the capped count, the readings and every statistic -- happens
@@ -38,7 +45,6 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-import statistics
 from datetime import datetime
 from typing import Any
 
@@ -101,6 +107,36 @@ def _abs_micros(a: datetime, b: datetime) -> int:
     """Absolute event-time distance between two UTC datetimes, in microseconds."""
     delta = a - b if a >= b else b - a
     return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _midpoint(low: float, high: float) -> float:
+    """Finite arithmetic mean ``(low + high) / 2`` of two ordered doubles.
+
+    A direct ``(low + high) / 2`` overflows to Infinity for two large values
+    of the same sign even though their midpoint is finite and representable
+    (e.g. two ``1e308`` neighbours must average back to ``1e308``).  When the
+    naive sum stays finite it is bit-for-bit identical to this path, so the
+    fallback only changes inputs that previously produced Infinity; mixed-sign
+    values sum without overflow, and summing the halves cannot either.
+    """
+    total = low + high
+    if math.isfinite(total):
+        return total / 2.0
+    return low / 2.0 + high / 2.0
+
+
+def _finite_median(values: list[float]) -> float:
+    """Median that stays finite whenever the result is a representable double.
+
+    Unlike ``statistics.median``, averaging the two middle values of an
+    even-length list never passes through an intermediate overflow, so a
+    median whose true value is finite is never returned as Infinity.
+    """
+    ordered = sorted(values)
+    mid, remainder = divmod(len(ordered), 2)
+    if remainder:
+        return ordered[mid]
+    return _midpoint(ordered[mid - 1], ordered[mid])
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +251,8 @@ def local_spikes(
             # Too little local context to judge this reading.
             insufficient += 1
             continue
-        local_median = statistics.median(neighbours)
-        mad = statistics.median(abs(v - local_median) for v in neighbours)
+        local_median = _finite_median(neighbours)
+        mad = _finite_median([abs(v - local_median) for v in neighbours])
         deviation = abs(sample["value"] - local_median)
         # Strict inequality; with MAD == 0 this still requires a non-zero
         # deviation (coefficient * 0 == 0).

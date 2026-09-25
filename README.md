@@ -66,6 +66,8 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 事件时间距离不超过 `window_seconds`（正数、边界含等号）的**其他**有效读数为邻居；邻居
 少于 3 条不判定，否则取邻居中位数与绝对偏差中位数（MAD），仅当读数与中位数的绝对差
 **严格大于** `sensitivity`（正数）乘 MAD 时标记为尖峰（MAD 为零时仍按严格大于零判断）。
+中位数与 MAD 的偶数项取平均时**不经过中间溢出**（四个 `1e308` 邻居的中位数仍为有限值
+`1e308` 而非 `Infinity`），凡数学上可表示为有限浮点的统计量一律返回有限 JSON 数值。
 响应给出每个尖峰的读数键、数值、局部中位数、MAD 与偏差，并列出有效读数数与邻居不足数；
 区间内已发布读数超过 200 条直接报错。
 
@@ -106,7 +108,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 415 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 422 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -980,6 +982,14 @@ UTC 形式（如 `...T12:00:00+02:00` 回显为 `...T10:00:00Z`，不带时区�
 - 当且仅当 `|value − local_median| > sensitivity * MAD`（**严格**大于）时标记为尖峰；
   因此 `MAD = 0`（邻居取值完全相同）时，只有偏差严格大于零的读数才会被标记。
 
+**防溢出偶数项平均**：中位数与 MAD 在偶数个取值时需要对中间两值取算术平均，直接做
+`(a + b) / 2` 会因中间相加溢出得到 `Infinity`（例如四条邻居均为 `1e308`：中位数本应是
+`1e308`，却变成 `Infinity`，继而使 `MAD` 与偏差全部为 `Infinity`，尖峰被漏判且返回值
+不是合法的有限 JSON 数值）。计算时优先走有限快路，仅在中间和非有限时改为
+`a/2 + b/2`（两有限值的中点必为有限可表示值）；因此凡数学上是有限双精度数的统计量都
+以有限数值返回（如该例：候选 `0` 相对四个 `1e308` 邻居被标记，`local_median=1e308`、
+`mad=0`、`deviation=1e308`）。奇数个取值的中位数直接取中间值，行为不变。
+
 响应中的 `spikes` 按 `(observed_at, seq)` 稳定排序，每项给出读数键 `key`
 （`observed_at`/`source_id`/`seq`）、`value`、`local_median`、`mad`、`deviation`；
 顶层给出回显的归一化参数与 `readings_count`（区间内已发布读数总数，先于有效值过滤）、
@@ -1137,7 +1147,7 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（30 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
 │   └── test_exposure.py   # 阈值暴露时长：持有语义/起点继承/同刻 seq/未知区间/value_key/只看已发布/400/只读/单快照测试（47 个）
-│   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照测试（53 个）
+│   └── test_local_spikes.py # 局部尖峰：中位数/MAD/严格判定/MAD 为零/邻居窗口与下限/闭区间/value_key/200 上限/400/只读/单快照/偶数项中位数与 MAD 防溢出（1e308）测试（60 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

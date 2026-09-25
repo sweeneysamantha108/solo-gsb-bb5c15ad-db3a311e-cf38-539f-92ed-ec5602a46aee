@@ -461,9 +461,12 @@ def get_local_spikes(
     median absolute deviation (MAD) are computed and the reading is flagged
     exactly when ``|value - median| > sensitivity * MAD`` -- strict even when
     the MAD is zero.  The response lists each spike's key, value, local
-    median, MAD and deviation, plus the valid and undecided counts.  More
-    than 200 published readings in the interval returns 400.  Buffered and
-    quarantined readings never participate and nothing is written.  Invalid
+    median, MAD and deviation, plus the valid and undecided counts.  The
+    even-count medians of the median and MAD steps are averaged without an
+    intermediate overflow, so every statistic whose true value is a finite
+    double (e.g. a median of four 1e308 neighbours) is returned as a finite
+    number rather than Infinity.  More than 200 published readings in the
+    interval returns 400.  Buffered and quarantined readings never participate and nothing is written.  Invalid
     interval/parameters or an unknown source return 400; an unknown session
     returns 404.
     """
