@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 
@@ -443,6 +444,125 @@ class TestOrdering:
         body = call(c, sid, window="5", sensitivity="3").json()
         assert [s["key"]["seq"] for s in body["spikes"]] == [4, 8]
         assert body["spikes"][1]["value"] == -77
+
+
+class TestOverflowSafeStatistics:
+    """Even-count medians must not overflow to Infinity near the float ceiling.
+
+    ``statistics.median`` averages the two middle values as ``(a + b) / 2``;
+    with two ``1e308`` middle values the addition overflows to Infinity,
+    poisoning the median/MAD/deviation and making the strict spike check miss
+    a genuine outlier.
+    """
+
+    def test_candidate_zero_between_four_max_magnitude_neighbours(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        # Candidate 0 in the middle; the four neighbours are all 1e308, so the
+        # even-count neighbour median averages two 1e308 middle values.
+        layout = [
+            (1, "2026-01-01T10:00:00Z", 1e308),
+            (2, "2026-01-01T10:00:05Z", 1e308),
+            (3, "2026-01-01T10:00:10Z", 0.0),
+            (4, "2026-01-01T10:00:15Z", 1e308),
+            (5, "2026-01-01T10:00:20Z", 1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+        body = call(c, sid, window="60", sensitivity="3").json()
+        assert body["valid_count"] == 5
+        assert body["insufficient_neighbors_count"] == 0
+        assert spike_keys(body) == [("2026-01-01T10:00:10Z", 3)]
+        sp = body["spikes"][0]
+        assert sp["value"] == 0.0
+        assert sp["local_median"] == 1e308
+        assert math.isfinite(sp["local_median"])
+        assert sp["mad"] == 0.0
+        assert sp["deviation"] == 1e308
+        assert math.isfinite(sp["deviation"])
+
+    def test_even_count_mad_middle_pair_near_ceiling_stays_finite(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        # Candidate 0; neighbours are 7e307, 9e307, 9e307, 1e308.  The
+        # neighbour median is finite (9e307, even average of 9e307+9e307),
+        # but the sorted deviations are [0, 0, 1e307, 9e307]: the even-count
+        # MAD averages 1e307 and 9e307, which (1e307 + 9e307) / 2 overflowed
+        # to Infinity with statistics.median, so sensitivity >= 1 missed this
+        # spike.  With the overflow-safe even average the MAD is 5e306.
+        layout = [
+            (1, "2026-01-01T10:00:00Z", 7e307),
+            (2, "2026-01-01T10:00:05Z", 9e307),
+            (3, "2026-01-01T10:00:10Z", 0.0),
+            (4, "2026-01-01T10:00:15Z", 9e307),
+            (5, "2026-01-01T10:00:20Z", 1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+        body = call(c, sid, window="60", sensitivity="1").json()
+        candidate = next(
+            (s for s in body["spikes"] if s["key"]["seq"] == 3), None
+        )
+        assert candidate is not None, body["spikes"]
+        sp = candidate
+        assert sp["local_median"] == 9e307
+        assert math.isfinite(sp["local_median"])
+        assert sp["mad"] == 4.999999999999998e306
+        assert sp["mad"] == pytest.approx(5e306, rel=1e-15)
+        assert math.isfinite(sp["mad"])
+        assert sp["deviation"] == 9e307
+        assert math.isfinite(sp["deviation"])
+        # 9e307 < 20 * ~5e306 (~1e308): the strict rule suppresses every
+        # spike with the larger coefficient.
+        assert call(c, sid, window="60", sensitivity="20").json()["spikes"] == []
+
+    def test_even_count_mad_middle_pair_opposite_extremes(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        # Candidate 0 (seq 3) with two -1e308 and two +1e308 neighbours:
+        # the even-count neighbour median averages opposite-sign middle
+        # values (-1e308..+1e308 straddle zero), which never overflowed and
+        # comes out as 0; every deviation is 1e308 so the MAD is a finite
+        # 1e308 and the candidate is not a spike.  This pins down that the
+        # opposite-sign direct-average branch stays finite too.
+        layout = [
+            (1, "2026-01-01T10:00:00Z", -1e308),
+            (2, "2026-01-01T10:00:05Z", -1e308),
+            (3, "2026-01-01T10:00:10Z", 0.0),
+            (4, "2026-01-01T10:00:15Z", 1e308),
+            (5, "2026-01-01T10:00:20Z", 1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+        body = call(c, sid, window="60", sensitivity="3").json()
+        assert body["insufficient_neighbors_count"] == 0
+        assert body["spikes"] == []
+
+    def test_truly_unrepresentable_deviation_is_infinity_not_finite_poison(self, client):
+        c, db_path = client
+        sid = create_session(c, sources=("a",))
+        # Three neighbours at +1e308 give a finite (odd-count) median 1e308;
+        # the candidate is -1e308, whose true distance (2e308) exceeds the
+        # finite float range.  The fix must not turn that into a finite
+        # value or a NaN: internally the deviation is +Infinity (so the
+        # reading is still flagged), while pydantic v2 renders Infinity as
+        # JSON null on the wire (the representable local_median/MAD stay
+        # finite and are echoed normally).
+        layout = [
+            (1, "2026-01-01T10:00:00Z", 1e308),
+            (2, "2026-01-01T10:00:05Z", 1e308),
+            (3, "2026-01-01T10:00:10Z", -1e308),
+            (4, "2026-01-01T10:00:15Z", 1e308),
+        ]
+        for seq, ts, value in layout:
+            insert_row(db_path, sid, "a", seq, ts, value)
+        body = call(c, sid, window="60", sensitivity="3").json()
+        assert spike_keys(body) == [("2026-01-01T10:00:10Z", 3)]
+        sp = body["spikes"][0]
+        assert sp["local_median"] == 1e308
+        assert sp["mad"] == 0.0
+        # Pydantic v2 serializes a non-finite float as JSON null.
+        assert sp["deviation"] is None
 
 
 class TestIntervalCap:

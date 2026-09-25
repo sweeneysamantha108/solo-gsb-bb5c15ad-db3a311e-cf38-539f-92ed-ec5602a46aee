@@ -460,12 +460,17 @@ def get_local_spikes(
     the reading is not judged; otherwise its local median and the neighbours'
     median absolute deviation (MAD) are computed and the reading is flagged
     exactly when ``|value - median| > sensitivity * MAD`` -- strict even when
-    the MAD is zero.  The response lists each spike's key, value, local
-    median, MAD and deviation, plus the valid and undecided counts.  More
-    than 200 published readings in the interval returns 400.  Buffered and
-    quarantined readings never participate and nothing is written.  Invalid
-    interval/parameters or an unknown source return 400; an unknown session
-    returns 404.
+    the MAD is zero.  The even-count averages inside both medians avoid the
+    overflowing ``a + b`` intermediate, so statistics representable as finite
+    floats (e.g. the median of four ``1e308`` neighbours) stay finite instead
+    of collapsing to Infinity and hiding a spike; internally only a
+    difference whose true magnitude exceeds the float range is Infinity
+    (serialized as JSON null by pydantic).  The response lists each spike's
+    key, value, local median, MAD and deviation, plus the valid and
+    undecided counts.  More than 200 published readings in the interval
+    returns 400.  Buffered and quarantined readings never participate and
+    nothing is written.  Invalid interval/parameters or an unknown source
+    return 400; an unknown session returns 404.
     """
     # Every parameter error must be 400 (not FastAPI's default 422), so the
     # query params are parsed/validated inside the module, like exposure.

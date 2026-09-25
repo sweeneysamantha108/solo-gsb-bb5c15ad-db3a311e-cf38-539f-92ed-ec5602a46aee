@@ -27,6 +27,14 @@ The comparison is strict, so when every neighbour is identical (``MAD = 0``)
 only a reading whose value differs from the median (strict deviation above
 zero) is flagged.
 
+The even-count averages inside both medians (neighbour median and MAD) are
+computed without an overflowing ``a + b`` intermediate, so magnitudes near
+the finite float ceiling do not collapse the statistics to ``Infinity`` and
+silently hide a spike: any statistic representable as a finite float (e.g.
+the median of four ``1e308`` neighbours) is returned finite.  Only a
+difference whose true magnitude exceeds the float range is ``inf`` (and it
+is still flagged; the API layer renders that non-finite float as JSON null).
+
 To keep the O(n^2) neighbour scan bounded, an interval containing more than
 200 published readings is rejected with 400 instead of being analysed.  The
 whole read -- the capped count, the readings and every statistic -- happens
@@ -38,7 +46,6 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-import statistics
 from datetime import datetime
 from typing import Any
 
@@ -101,6 +108,45 @@ def _abs_micros(a: datetime, b: datetime) -> int:
     """Absolute event-time distance between two UTC datetimes, in microseconds."""
     delta = a - b if a >= b else b - a
     return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _even_median(values: list[float]) -> float:
+    """Median of an even-length sorted list, without overflowing on the average.
+
+    The plain ``(a + b) / 2`` average of the two middle values overflows to
+    ``Infinity`` when both sit near the finite float ceiling (two ``1e308``
+    neighbours sum past ``sys.float_info.max``); every statistic derived from
+    that median then becomes ``inf`` and the strict spike comparison silently
+    misses readings around such magnitudes.  Same-sign middle values are
+    averaged as ``a + (b - a) / 2`` -- neither the difference nor the final
+    addition can exceed the larger magnitude, so no intermediate overflows
+    (one final rounding remains, which is within one ulp) -- while opposite
+    signs (and zeros) use the direct average, whose sum cannot overflow.
+    The result differs from ``statistics.median`` by at most one ulp (and
+    matches it for the integer-valued and same-magnitude cases used here).
+    """
+    mid = len(values) // 2
+    low, high = values[mid - 1], values[mid]
+    if low == high:
+        # Also covers (inf, inf): the average is inf, never a NaN poisoned
+        # by ``inf - inf`` in the same-sign branch below.
+        return low
+    if (low > 0.0 and high > 0.0) or (low < 0.0 and high < 0.0):
+        # Same sign: |high - low| <= max(|low|, |high|), so neither the
+        # subtraction nor the final addition can overflow to inf.
+        return low + (high - low) / 2.0
+    # Opposite signs (or a zero middle value): |low + high| cannot exceed the
+    # larger magnitude, so the direct average is overflow-safe.
+    return (low + high) / 2.0
+
+
+def _median(values: list[float]) -> float:
+    """Median of ``values`` (len >= 1), even-count average overflow-safe."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n % 2:
+        return ordered[n // 2]
+    return _even_median(ordered)
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +261,11 @@ def local_spikes(
             # Too little local context to judge this reading.
             insufficient += 1
             continue
-        local_median = statistics.median(neighbours)
-        mad = statistics.median(abs(v - local_median) for v in neighbours)
+        # _median avoids the overflowing ``a + b`` intermediate in the
+        # even-count average, so neighbours near the finite ceiling yield a
+        # finite median/MAD instead of poisoning everything with inf.
+        local_median = _median(neighbours)
+        mad = _median([abs(v - local_median) for v in neighbours])
         deviation = abs(sample["value"] - local_median)
         # Strict inequality; with MAD == 0 this still requires a non-zero
         # deviation (coefficient * 0 == 0).

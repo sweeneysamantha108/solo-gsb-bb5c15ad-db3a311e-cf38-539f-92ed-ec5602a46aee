@@ -884,17 +884,27 @@ class LocalSpikeOut(BaseModel):
     value: float = Field(..., description="The reading's finite numeric value")
     local_median: float = Field(
         ...,
-        description="Median of the in-window neighbour values (excluding this reading)",
+        description=(
+            "Median of the in-window neighbour values (excluding this reading);"
+            " finite whenever representable -- the even-count middle-value"
+            " average is computed without an overflowing intermediate"
+        ),
     )
     mad: float = Field(
         ...,
         description=(
             "Median absolute deviation of the neighbours from local_median;"
-            " zero when every neighbour equals the median"
+            " zero when every neighbour equals the median; finite whenever"
+            " representable (the even-count average avoids overflow)"
         ),
     )
     deviation: float = Field(
-        ..., description="Absolute difference |value - local_median|"
+        ...,
+        description=(
+            "Absolute difference |value - local_median|; internally Infinity"
+            " only when the true difference exceeds the finite float range"
+            " (serialized as JSON null by pydantic)"
+        ),
     )
 
 
